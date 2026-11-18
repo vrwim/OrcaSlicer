@@ -57,6 +57,10 @@ static const constexpr int UNARRANGED = -1;
 /// Zero is the physical bed, larger than zero means a virtual bed.
 struct ArrangePolygon {
     ExPolygon poly;                 /// The 2D silhouette to be arranged
+    /// Optional precise (possibly concave) footprint, in the same frame as poly.
+    /// Above ArrangeGeometry::Fast, collisions are computed from it, while poly
+    /// (its convex hull) is still used for scoring.
+    ExPolygons outline;
     Vec2crd   translation{0, 0};    /// The translation of the poly
     double    rotation{0.0};        /// The rotation of the poly in radians
     coord_t   inflation = 0;        /// Arrange with inflated polygon
@@ -125,6 +129,14 @@ struct ArrangePolygon {
 
 using ArrangePolygons = std::vector<ArrangePolygon>;
 
+/// How closely arrange follows each object's real footprint (ArrangePolygon::outline).
+enum class ArrangeGeometry {
+    Fast,       ///< Convex hulls only: Orca's original arrange.
+    Balanced,   ///< Placed objects collide by their outline, the moving object by its hull.
+    Precise,    ///< Both by their outline, with 8 rotations when rotation is allowed.
+    Exhaustive, ///< As Precise, with a wider search.
+};
+
 struct ArrangeParams {
 
     /// The minimum distance which is allowed for any
@@ -139,6 +151,19 @@ struct ArrangeParams {
     bool parallel = true;
 
     bool allow_rotations = false;
+
+    /// Printing by object always arranges at Fast; see effective_geometry().
+    ArrangeGeometry geometry = ArrangeGeometry::Fast;
+
+    /// What Exhaustive varies between its runs. The defaults are the normal arrange.
+    struct Variant {
+        /// Reorders items of similar area (within about 20%); 0 keeps the normal order.
+        unsigned order_seed = 0;
+        /// Scales the pull towards the pile's center against its density, above Fast.
+        double distance_weight = 1.;
+        /// Grows the pile from the bed's center instead of a corner.
+        bool start_at_center = false;
+    } variant;
 
     bool do_final_align = true;
 
@@ -188,6 +213,7 @@ struct ArrangeParams {
         ret += "\"accuracy\":" + std::to_string(accuracy) + ",";
         ret += "\"parallel\":" + std::to_string(parallel) + ",";
         ret += "\"allow_rotations\":" + std::to_string(allow_rotations) + ",";
+        ret += "\"geometry\":" + std::to_string(int(geometry)) + ",";
         ret += "\"do_final_align\":" + std::to_string(do_final_align) + ",";
         ret += "\"allow_multi_materials_on_same_plate\":" + std::to_string(allow_multi_materials_on_same_plate) + ",";
         ret += "\"avoid_extrusion_cali_region\":" + std::to_string(avoid_extrusion_cali_region) + ",";
@@ -203,6 +229,33 @@ struct ArrangeParams {
     }
 
 };
+
+/// Stable names, as stored in the app config.
+inline const char *arrange_geometry_name(ArrangeGeometry g)
+{
+    switch (g) {
+    case ArrangeGeometry::Balanced: return "balanced";
+    case ArrangeGeometry::Precise: return "precise";
+    case ArrangeGeometry::Exhaustive: return "exhaustive";
+    default: return "fast";
+    }
+}
+
+/// The level with the given name; Fast for anything unknown.
+inline ArrangeGeometry arrange_geometry_from_name(const std::string &name)
+{
+    for (ArrangeGeometry g : {ArrangeGeometry::Balanced, ArrangeGeometry::Precise, ArrangeGeometry::Exhaustive})
+        if (name == arrange_geometry_name(g))
+            return g;
+    return ArrangeGeometry::Fast;
+}
+
+/// The geometry level arrange actually uses. Printing by object keeps the convex hulls:
+/// the extruder clearance checks work on them.
+inline ArrangeGeometry effective_geometry(const ArrangeParams &params)
+{
+    return params.is_seq_print ? ArrangeGeometry::Fast : params.geometry;
+}
 
 void update_arrange_params(ArrangeParams& params, const DynamicPrintConfig* print_cfg, const ArrangePolygons& selected);
 

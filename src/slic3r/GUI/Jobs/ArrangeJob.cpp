@@ -251,6 +251,8 @@ ArrangePolygon ArrangeJob::prepare_arrange_polygon(void *model_instance, const P
     ModelInstance* instance = (ModelInstance*)model_instance;
     const Slic3r::DynamicPrintConfig& config = wxGetApp().preset_bundle->full_config();
     ArrangePolygon polygon = get_instance_arrange_poly(instance, config);
+    if (arrangement::effective_geometry(params) != arrangement::ArrangeGeometry::Fast)
+        polygon.outline = get_instance_precise_outline(*instance);
     if (mapping_plate != nullptr)
         set_arrange_polygon_bed_exclusion_extruders(polygon, *instance->get_object(), *mapping_plate, config);
     return polygon;
@@ -1001,6 +1003,7 @@ arrangement::ArrangeParams init_arrange_params(Plater *p)
     params.object_skirt_offset                 = object_skirt_offset;
     params.printable_height                    = print_config.printable_height.value;
     params.allow_rotations                     = settings.enable_rotation;
+    params.geometry                            = settings.geometry;
     params.nozzle_height                       = print_config.nozzle_height.value;
     params.align_center                        = print_config.best_object_pos.value;
     params.allow_multi_materials_on_same_plate = settings.allow_multi_materials_on_same_plate;

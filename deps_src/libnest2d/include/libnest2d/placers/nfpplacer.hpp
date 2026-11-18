@@ -1,7 +1,10 @@
 #ifndef NOFITPOLY_HPP
 #define NOFITPOLY_HPP
 
+#include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <deque>
 
 // For parallel for
 #include <functional>
@@ -92,6 +95,31 @@ struct NfpPConfig {
     bool explore_holes = false;
 
     /**
+     * @brief Use the convex decomposition (see _Item::convexParts) of the
+     * already placed items for the no-fit polygons instead of their convex
+     * outline, so other items can enter their concavities and holes. Every
+     * pair of parts gets its own convex-convex NFP and their union is the NFP
+     * of the two items.
+     */
+    bool fixed_precise = false;
+
+    /**
+     * @brief Use the convex decomposition of the item being placed as well,
+     * so two concave items can interlock.
+     */
+    bool moving_precise = false;
+
+    /**
+     * @brief Lookahead (beam search). Above 1, the best lookahead_width
+     * placements of an item are each followed by placing the next items,
+     * lookahead_depth items in all, and the item takes the placement whose
+     * branch is best: most items placed, then the lowest sum of the placement
+     * scores. 1 places greedily.
+     */
+    unsigned lookahead_depth = 1;
+    unsigned lookahead_width = 5;
+
+    /**
      * @brief If true, use all CPUs available. Run on a single core otherwise.
      */
     bool parallel = true;
@@ -125,6 +153,10 @@ struct NfpPConfig {
                        )> before_packing;
 
     std::function<void(const ItemGroup &, NfpPConfig &config)> on_preload;
+
+    // Returns true when the caller cancelled. Checked before every rotation, so one
+    // slow item does not hold up the cancel; the item keeps the best rotation so far.
+    std::function<bool()> stop_condition;
 
     // Return false when a packed item does not constrain this candidate.
     // By default every pair participates in the 2D collision calculation.
@@ -538,12 +570,9 @@ public:
     template<class Range = ConstItemRange<typename Base::DefaultIter>>
     PackResult trypack(Item& item,
                         const Range& remaining = Range()) {
-        auto result = _trypack(item, remaining);
-
-        // Experimental
-        // if(!result) repack(item, result);
-
-        return result;
+        if (config_.lookahead_depth < 2 || !remaining.valid || remaining.from == remaining.to)
+            return _trypack(item, remaining);
+        return lookahead(item, remaining);
     }
 
     void accept(PackResult& r) {
@@ -612,18 +641,80 @@ private:
         }
         // /////////////////////////////////////////////////////////////////////
 
-        __parallel::enumerate(collision_items.begin(), collision_items.end(),
-                              [&nfps, &trsh](Item *const &sh, size_t n)
-        {
-            auto& fixedp = sh->transformedShape();
-            auto& orbp = trsh.transformedShape();
-            auto subnfp_r = noFitPolygon<NfpLevel::CONVEX_ONLY>(fixedp, orbp);
-            correctNfpPosition(subnfp_r, *sh, trsh);
-            nfps[n] = subnfp_r.first;
-        });
+        const bool fixed_parts  = config_.fixed_precise &&
+                                  std::any_of(collision_items.begin(), collision_items.end(),
+                                              [](const Item *itm) { return itm->hasConvexParts(); });
+        const bool moving_parts = config_.moving_precise && trsh.hasConvexParts();
+
+        if (fixed_parts || moving_parts) {
+            trsh.transformedConvexParts();
+            for (Item *item : collision_items)
+                item->transformedConvexParts();
+
+            std::vector<Shapes> part_nfps(collision_items.size());
+            const bool          fp = config_.fixed_precise, mp = config_.moving_precise;
+            __parallel::enumerate(collision_items.begin(), collision_items.end(),
+                                  [&part_nfps, &trsh, fp, mp](Item *const &sh, size_t n)
+            {
+                part_nfps[n] = partsNfp(*sh, trsh, fp, mp);
+            });
+
+            nfps.clear();
+            for (Shapes &pn : part_nfps)
+                for (RawShape &p : pn)
+                    nfps.emplace_back(std::move(p));
+        } else {
+            __parallel::enumerate(collision_items.begin(), collision_items.end(),
+                                  [&nfps, &trsh](Item *const &sh, size_t n)
+            {
+                auto& fixedp = sh->transformedShape();
+                auto& orbp = trsh.transformedShape();
+                auto subnfp_r = noFitPolygon<NfpLevel::CONVEX_ONLY>(fixedp, orbp);
+                correctNfpPosition(subnfp_r, *sh, trsh);
+                nfps[n] = subnfp_r.first;
+            });
+        }
 
         RawShape innerNfp = nfpInnerRectBed(bed, trsh.transformedShape()).first;
         return nfp::subtract({innerNfp}, nfps);
+    }
+
+    // NFP of two items from their convex parts, as in PrusaSlicer's accurate
+    // arrange: the NFP of two concave shapes is the union of the convex NFPs
+    // of every (stationary part, orbiting part) pair. Each part NFP is the
+    // locus of that orbiting part's own reference vertex, so it is shifted by
+    // the offset from the part's reference vertex to the item's, which is
+    // the point the placer drags along the NFP. An item that is not taken
+    // precisely counts as one part: its convex outline.
+    static Shapes partsNfp(const Item &stationary, const Item &orbiter, bool fixed_precise, bool moving_precise)
+    {
+        using namespace nfp;
+
+        const Shapes fixed_whole = fixed_precise ? Shapes{} : Shapes{stationary.transformedShape()};
+        const Shapes orb_whole   = moving_precise ? Shapes{} : Shapes{orbiter.transformedShape()};
+        const auto  &fixed_parts = fixed_precise ? stationary.transformedConvexParts() : fixed_whole;
+        const auto  &orb_parts   = moving_precise ? orbiter.transformedConvexParts() : orb_whole;
+        const Vertex orb_ref    = orbiter.referenceVertex();
+
+        Shapes ret;
+        ret.reserve(fixed_parts.size() * orb_parts.size());
+
+        for (const RawShape &fp : fixed_parts) {
+            const Vertex fp_top = rightmostUpVertex(fp);
+            for (const RawShape &mp : orb_parts) {
+                auto subnfp = noFitPolygon<NfpLevel::CONVEX_ONLY>(fp, mp);
+                if (sl::contourVertexCount(subnfp.first) < 3) continue;
+
+                const Vertex mp_top    = rightmostUpVertex(mp);
+                const Vertex dtouch    = fp_top - leftmostDownVertex(mp);
+                const Vertex top_other = mp_top + dtouch;
+                const Vertex d         = (top_other - subnfp.second) + (orb_ref - mp_top);
+                sl::translate(subnfp.first, d);
+                ret.emplace_back(std::move(subnfp.first));
+            }
+        }
+
+        return ret;
     }
 
     Shapes calcnfp(const RawShape &sliding, const Shapes &stationarys, const Box &bed, Lvl<nfp::NfpLevel::CONVEX_ONLY>)
@@ -651,6 +742,122 @@ private:
         return {};
     }
 
+    // A placement of an item the optimizer found: translation, rotation, score.
+    struct Candidate {
+        double  score;
+        Vertex  tr;
+        Radians rot;
+    };
+
+    // Sorts the candidates best first and keeps the lookahead_width best that are
+    // not the same placement: same rotation and less than 0.1% of the bin apart.
+    // A candidate the scoring rejects (e.g. an incompatible filament) is dropped
+    // when an acceptable one exists.
+    void keepBestDistinct(std::vector<Candidate> &cands) const
+    {
+        std::stable_sort(cands.begin(), cands.end(), [](const Candidate &a, const Candidate &b) { return a.score < b.score; });
+        const double near    = 1e-3 * norm_;
+        const bool   any_ok  = !cands.empty() && cands.front().score < LARGE_COST_TO_REJECT;
+        std::vector<Candidate> kept;
+        for (const Candidate &c : cands) {
+            if (kept.size() == config_.lookahead_width) break;
+            if (any_ok && c.score >= LARGE_COST_TO_REJECT) break;
+            const bool same = std::any_of(kept.begin(), kept.end(), [&](const Candidate &k) {
+                return std::abs(double(k.rot) - double(c.rot)) < 1e-9 && pl::distance(k.tr, c.tr) < near;
+            });
+            if (!same) kept.push_back(c);
+        }
+        cands = std::move(kept);
+    }
+
+    // What the lookahead compares: more items placed, then a lower sum of the
+    // placement scores along the branch. The scores already weigh what matters for
+    // the plate (a compact pile that can still grow from the starting point); a
+    // geometric measure such as the pile's hull area alone let the pile drift to the
+    // bin's edge and fit fewer items.
+    struct Layout {
+        size_t placed = 0;
+        double score  = 0.;
+        bool   better_than(const Layout &o) const
+        {
+            if (placed != o.placed) return placed > o.placed;
+            return score < o.score;
+        }
+    };
+
+    Layout layout() const
+    {
+        Layout l;
+        for (const Item &itm : items_)
+            if (!itm.is_virt_object) ++l.placed;
+        return l;
+    }
+
+    // A copy of this placer to try placements on. Its items are references to
+    // the caller's, so it must not align them when it goes away.
+    struct Branch {
+        _NofitPolyPlacer placer;
+        explicit Branch(const _NofitPolyPlacer &p) : placer(p) {}
+        ~Branch() { placer.Base::clearItems(); }
+        void place(Item &copy, const Candidate &c)
+        {
+            copy.translation(c.tr);
+            copy.rotation(c.rot);
+            PackResult r(copy);
+            placer.accept(r);
+        }
+    };
+
+    // The best branch reachable by placing the next depth items from [next, end).
+    template<class It> Layout bestLayout(It next, It end, unsigned depth, std::deque<Item> &store)
+    {
+        if (depth == 0 || next == end || (config_.stop_condition && config_.stop_condition()))
+            return layout();
+        Item                  &itm = store.emplace_back(static_cast<const Item &>(*next));
+        std::vector<Candidate> cands;
+        _trypack(itm, ConstItemRange<It>(std::next(next), end), &cands);
+        if (cands.empty())
+            return layout();
+        Layout best;
+        bool   any = false;
+        for (const Candidate &c : cands) {
+            Branch b(*this);
+            b.place(store.emplace_back(itm), c);
+            Layout l = b.placer.bestLayout(std::next(next), end, depth - 1, store);
+            l.score += c.score;
+            if (!any || l.better_than(best)) { best = l; any = true; }
+        }
+        return best;
+    }
+
+    // Places the item where the branch through the next lookahead_depth - 1 items is
+    // best, out of the lookahead_width best placements the optimizer found for it.
+    template<class Range> PackResult lookahead(Item &item, const Range &remaining)
+    {
+        std::vector<Candidate> cands;
+        PackResult             greedy = _trypack(item, remaining, &cands);
+        if (!greedy || cands.size() < 2)
+            return greedy;
+
+        std::deque<Item> store;
+        size_t           best_i = 0;
+        Layout           best;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (config_.stop_condition && config_.stop_condition())
+                break;
+            Branch b(*this);
+            b.place(store.emplace_back(item), cands[i]);
+            Layout l = b.placer.bestLayout(remaining.from, remaining.to, config_.lookahead_depth - 1, store);
+            l.score += cands[i].score;
+            if (i == 0 || l.better_than(best)) { best = l; best_i = i; }
+        }
+        item.translation(cands[best_i].tr);
+        item.rotation(cands[best_i].rot);
+        PackResult ret(item);
+        ret.score_ = cands[best_i].score;
+        return ret;
+    }
+
     struct Optimum {
         double relpos;
         unsigned nfpidx;
@@ -674,9 +881,12 @@ private:
     using Edges = EdgeCache<RawShape>;
 
     template<class Range = ConstItemRange<typename Base::DefaultIter>>
+    // With candidates, also returns the lookahead_width best distinct placements
+    // found, best first.
     PackResult _trypack(
             Item& item,
-            const Range& remaining = Range()) {
+            const Range& remaining = Range(),
+            std::vector<Candidate>* candidates = nullptr) {
 
         PackResult ret;
 
@@ -792,6 +1002,8 @@ private:
                 placed.leftmostBottomVertex();
                 placed.boundingBox();
                 placed.area();
+                if (config_.fixed_precise)
+                    placed.transformedConvexParts();
             }
 
             if(config_.before_packing)
@@ -802,6 +1014,7 @@ private:
                 double score   = std::numeric_limits<double>::max();
                 double overfit = std::numeric_limits<double>::max();
                 Vertex tr{0, 0};
+                std::vector<Candidate> candidates; // one per NFP contour or hole, when collecting
             };
             std::vector<RotationResult> rot_results(config_.rotations.size());
             std::vector<size_t>         rot_indices(config_.rotations.size());
@@ -814,6 +1027,16 @@ private:
             std::launch rot_policy   = rot_parallel ? std::launch::deferred | std::launch::async : std::launch::deferred;
 
             __parallel::enumerate(rot_indices.begin(), rot_indices.end(), [&](size_t ri, size_t) {
+                // A rotation a whole period away from an earlier one gives the same shape.
+                const double period = unrotated.rotationPeriod();
+                for (size_t rj = 0; rj < ri; ++rj) {
+                    const double k = (double(config_.rotations[ri]) - double(config_.rotations[rj])) / period;
+                    if (std::abs(k - std::round(k)) < 1e-6)
+                        return;
+                }
+                if (config_.stop_condition && config_.stop_condition())
+                    return;
+
                 const Radians       rot = config_.rotations[ri];
                 std::optional<Item> own;
                 Item               &item        = rot_parallel ? own.emplace(unrotated) : unrotated;
@@ -878,6 +1101,12 @@ private:
                     return miss;
                 };
 
+                // A contour's or hole's optimum that keeps the pile in the bin.
+                auto collect = [&](const Optimum &o, double score) {
+                    if (boundaryCheck(o) <= 0)
+                        rot_results[ri].candidates.push_back({score, (getNfpPoint(o) - iv) + startpos, initial_rot + rot});
+                };
+
                 Optimum optimum(0, 0);
                 double best_score = std::numeric_limits<double>::max();
                 std::launch policy = std::launch::deferred;
@@ -931,6 +1160,9 @@ private:
                     auto mr = *std::min_element(results.begin(), results.end(),
                                                 resultcomp);
 
+                    if (candidates)
+                        collect(Optimum(std::get<0>(mr.optimum), ch, -1), mr.score);
+
                     if(mr.score < best_score) {
                         Optimum o(std::get<0>(mr.optimum), ch, -1);
                         double miss = boundaryCheck(o);
@@ -979,6 +1211,9 @@ private:
                                                     results.end(),
                                                     resultcomp);
 
+                        if (candidates)
+                            collect(Optimum(std::get<0>(hmr.optimum), ch, int(hidx)), hmr.score);
+
                         if(hmr.score < best_score) {
                             Optimum o(std::get<0>(hmr.optimum),
                                       ch, hidx);
@@ -1011,6 +1246,12 @@ private:
                     can_pack     = true;
                     global_score = res.score;
                 }
+            }
+
+            if (candidates) {
+                for (RotationResult &res : rot_results)
+                    candidates->insert(candidates->end(), res.candidates.begin(), res.candidates.end());
+                keepBestDistinct(*candidates);
             }
 
             item.translation(final_tr);

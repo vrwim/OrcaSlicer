@@ -793,6 +793,7 @@ target_link_libraries(libslic3r
         cereal::cereal
         Clipper2
         draco::draco
+        earcut
         glu-libtess
         JPEG::JPEG
         libslic3r_cgal

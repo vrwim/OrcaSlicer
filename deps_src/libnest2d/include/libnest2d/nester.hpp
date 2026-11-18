@@ -73,6 +73,24 @@ class _Item {
     int binid_{BIN_ID_UNSET}, priority_{0};
     bool fixed_{false};
 
+    // Optional convex decomposition of the item's real (possibly concave)
+    // footprint, in the frame of the raw shape (not inflated, rotated or
+    // translated). When set, the NFP placer can compute the no-fit polygon
+    // from these parts instead of the (convex) raw shape, which lets concave
+    // objects nest into each other. The raw shape should then be the convex
+    // hull of the parts: it is still used for bounding boxes, scoring and
+    // bed fitting.
+    std::vector<RawShape> convex_parts_;
+    mutable std::vector<RawShape> tr_parts_cache_;
+    mutable bool tr_parts_valid_ = false;
+    mutable double tr_parts_rot_ = 0.;
+    mutable Vertex tr_parts_tr_{0, 0};
+    mutable Coord tr_parts_infl_{0};
+
+    // Turning the item by a multiple of this angle gives the same shape up to a
+    // translation, so the placer tries only one rotation of each such class.
+    Radians rotation_period_ = 2 * Pi;
+
 public:
     int itemid_{ 0 };
     std::vector<int> extrude_ids;
@@ -370,6 +388,58 @@ public:
     inline operator RawShape() const
     {
         return transformedShape();
+    }
+
+    /// Set the convex decomposition of the item's precise footprint.
+    inline void convexParts(std::vector<RawShape> parts)
+    {
+        convex_parts_ = std::move(parts);
+        tr_parts_valid_ = false;
+    }
+
+    inline bool hasConvexParts() const BP2D_NOEXCEPT { return !convex_parts_.empty(); }
+
+    inline void    rotationPeriod(Radians period) BP2D_NOEXCEPT { rotation_period_ = period; }
+    inline Radians rotationPeriod() const BP2D_NOEXCEPT { return rotation_period_; }
+
+    /// The convex parts with inflation, rotation and translation applied. If
+    /// no decomposition was set, this is the transformed shape alone. Each
+    /// part has the orientation of transformedShape(), as the NFP code needs.
+    inline const std::vector<RawShape>& transformedConvexParts() const
+    {
+        const RawShape& whole = transformedShape();
+
+        if (tr_parts_valid_ && tr_parts_rot_ == double(rotation_) &&
+            tr_parts_tr_ == translation_ && tr_parts_infl_ == inflation_)
+            return tr_parts_cache_;
+
+        tr_parts_cache_.clear();
+        if (convex_parts_.empty()) {
+            tr_parts_cache_.emplace_back(whole);
+        } else {
+            tr_parts_cache_.reserve(convex_parts_.size());
+            const bool whole_positive = sl::area(whole) >= 0;
+            for (const RawShape& part : convex_parts_) {
+                RawShape cpy = part;
+                // Dilation distributes over union, so inflating every part
+                // covers the same area as inflating the whole outline.
+                if (has_inflation_ && inflation_ != 0) sl::offset(cpy, inflation_);
+                if (has_rotation_) sl::rotate(cpy, rotation_);
+                if (has_translation_) sl::translate(cpy, translation_);
+                if (sl::contourVertexCount(cpy) < 3) continue;
+                if ((sl::area(cpy) >= 0) != whole_positive)
+                    std::reverse(sl::begin(cpy), sl::end(cpy));
+                tr_parts_cache_.emplace_back(std::move(cpy));
+            }
+            if (tr_parts_cache_.empty()) tr_parts_cache_.emplace_back(whole);
+        }
+
+        tr_parts_rot_   = double(rotation_);
+        tr_parts_tr_    = translation_;
+        tr_parts_infl_  = inflation_;
+        tr_parts_valid_ = true;
+
+        return tr_parts_cache_;
     }
 
     inline const RawShape& rawShape() const BP2D_NOEXCEPT

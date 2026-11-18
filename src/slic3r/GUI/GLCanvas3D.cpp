@@ -86,6 +86,7 @@
 #include "libslic3r/Tesselate.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/AppConfig.hpp"
+#include "libslic3r/Arrange.hpp"
 #include "3DScene.hpp"
 #include "BackgroundSlicingProcess.hpp"
 #include "CameraUtils.hpp"
@@ -2097,6 +2098,42 @@ const double GLCanvas3D::DefaultCameraZoomToPlateMarginFactor = 1.25;
 // Main-thread only: _render_frame never runs off it, so no atomic is needed.
 int GLCanvas3D::s_frames_in_progress = 0;
 
+// Reads "geometry_level<postfix>"; a missing or unknown value leaves out unchanged.
+static void load_arrange_geometry(const AppConfig &cfg, const std::string &postfix, arrangement::ArrangeGeometry &out)
+{
+    const std::string key = "geometry_level" + postfix;
+    if (cfg.has("arrange", key))
+        out = arrangement::arrange_geometry_from_name(cfg.get("arrange", key));
+}
+
+// The "Geometry" dropdown of the arrange menu; a change is stored under config_key.
+static void render_arrange_geometry_combo(ImGuiWrapper &imgui, arrangement::ArrangeGeometry &geometry, AppConfig &cfg,
+                                          const std::string &config_key, bool disabled, float label_width, float width)
+{
+    if (disabled)
+        imgui.disabled_begin(true);
+    // In the order of arrangement::ArrangeGeometry.
+    const std::vector<std::string> levels = {_u8L_CONTEXT("Fast", "Arrange geometry"), _u8L_CONTEXT("Balanced", "Arrange geometry"),
+                                             _u8L_CONTEXT("Precise", "Arrange geometry"),
+                                             _u8L_CONTEXT("Exhaustive (very slow)", "Arrange geometry")};
+    int level = int(geometry);
+    if (imgui.combo(_L("Geometry"), levels, level, 0, label_width, width)) {
+        geometry = arrangement::ArrangeGeometry(level);
+        cfg.set("arrange", config_key, arrangement::arrange_geometry_name(geometry));
+    }
+    if (ImGui::IsItemHovered())
+        imgui.tooltip(_L("How closely objects follow each other's real shape.\n"
+                         "Fast: every object is taken as its convex hull.\n"
+                         "Balanced: objects already placed keep their real outline, so others can fill their holes and recesses. "
+                         "Up to about 10 times slower.\n"
+                         "Precise: every object keeps its real outline, so concave parts can interlock, and auto rotation tries 8 angles. "
+                         "Up to several hundred times slower for objects with holes.\n"
+                         "Exhaustive: like Precise, with a wider search. Very slow."),
+                      imgui.scaled(24.f));
+    if (disabled)
+        imgui.disabled_end();
+}
+
 void GLCanvas3D::load_arrange_settings()
 {
     // Each key must match what _render_arrange_menu writes, which appends a per-mode
@@ -2123,6 +2160,9 @@ void GLCanvas3D::load_arrange_settings()
     load_bool("enable_rotation_fff",           m_arrange_settings_fff.enable_rotation);
     load_bool("enable_rotation_fff_seq_print", m_arrange_settings_fff_seq_print.enable_rotation);
     load_bool("enable_rotation_sla",           m_arrange_settings_sla.enable_rotation);
+
+    load_arrange_geometry(*wxGetApp().app_config, "_fff", m_arrange_settings_fff.geometry);
+    load_arrange_geometry(*wxGetApp().app_config, "_sla", m_arrange_settings_sla.geometry);
 
     // These two keys carry no postfix, so the one stored value covers both FFF modes.
     load_bool("allow_multi_materials_on_same_plate", m_arrange_settings_fff.allow_multi_materials_on_same_plate);
@@ -7430,7 +7470,7 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     auto &appcfg = wxGetApp().app_config;
     PrinterTechnology ptech = current_printer_technology();
 
-    std::string dist_key = "min_object_distance", rot_key = "enable_rotation";
+    std::string dist_key = "min_object_distance", rot_key = "enable_rotation", geometry_key = "geometry_level";
     std::string multi_material_key = "allow_multi_materials_on_same_plate";
     std::string avoid_extrusion_key = "avoid_extrusion_cali_region";
     std::string postfix;
@@ -7444,8 +7484,9 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
         postfix      = seq_print ? "_fff_seq_print" : "_fff";
     }
 
-    dist_key += postfix;
-    rot_key  += postfix;
+    dist_key    += postfix;
+    rot_key     += postfix;
+    geometry_key += postfix;
 
     ImGui::AlignTextToFramePadding();
     imgui->text(_L("Spacing"));
@@ -7464,6 +7505,12 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
     ImGui::Separator();
     if (imgui->bbl_checkbox(_L("Auto rotate for arrangement"), settings_out.enable_rotation))
         appcfg->set("arrange", rot_key.c_str(), settings_out.enable_rotation);
+
+    // Printing by object keeps the convex hull: the extruder clearance checks work on hulls.
+    if (seq_print)
+        settings_out.geometry = arrangement::ArrangeGeometry::Fast;
+    render_arrange_geometry_combo(*imgui, settings_out.geometry, *appcfg, geometry_key, seq_print, 1.2f * cursor_slider_left,
+                                  window_width - 0.2f * cursor_slider_left);
 
     if (imgui->bbl_checkbox(_L("Allow multiple materials on same plate"), settings_out.allow_multi_materials_on_same_plate))
         appcfg->set("arrange", multi_material_key.c_str(), settings_out.allow_multi_materials_on_same_plate);
@@ -7513,6 +7560,7 @@ void GLCanvas3D::_render_arrange_menu(float left, float right, float bottom, flo
 
         appcfg->erase("arrange", dist_key);
         appcfg->erase("arrange", rot_key);
+        appcfg->erase("arrange", geometry_key);
         appcfg->erase("arrange", multi_material_key);
         appcfg->erase("arrange", avoid_extrusion_key);
     }

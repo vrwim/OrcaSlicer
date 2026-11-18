@@ -16,6 +16,9 @@
 #include "BoundingBox.hpp"
 #include "ExPolygon.hpp"
 #include "Polygon.hpp"
+#include "ClipperUtils.hpp"
+#include "TriangleMeshSlicer.hpp"
+#include "Geometry.hpp"
 
 namespace Slic3r {
 
@@ -199,6 +202,28 @@ ArrangePolygon get_instance_arrange_poly(ModelInstance* instance, const Slic3r::
     ap.has_z_range = bbox.defined;
     ap.name = obj->name;
     return ap;
+}
+
+ExPolygons get_instance_precise_outline(const ModelInstance &instance)
+{
+    // Same transformation as ModelInstance::get_arrange_polygon().
+    Vec3d rotation = instance.get_rotation();
+    rotation.z()   = 0.;
+    Geometry::Transformation t(instance.get_transformation());
+    t.set_offset(instance.get_offset().z() * Vec3d::UnitZ());
+    t.set_rotation(rotation);
+    const Transform3d trafo = t.get_matrix();
+
+    ExPolygons outline;
+    for (const ModelVolume *v : instance.get_object()->volumes) {
+        if (v->is_model_part())
+            outline = union_ex(outline, project_mesh(v->mesh().its, trafo * v->get_matrix(), [] {}));
+    }
+    for (const ModelVolume *v : instance.get_object()->volumes) {
+        if (v->is_negative_volume())
+            outline = diff_ex(outline, project_mesh(v->mesh().its, trafo * v->get_matrix(), [] {}));
+    }
+    return outline;
 }
 
 } // namespace Slic3r

@@ -8,6 +8,7 @@
 #include "Exception.hpp"
 #include <string>
 #include "Point.hpp"
+#include "ExPolygon.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/Model.hpp"
 
@@ -98,6 +99,11 @@ template<>
 arrangement::ArrangePolygon get_arrange_poly(ModelInstance* inst, const DynamicPrintConfig& config);
 
 ArrangePolygon get_instance_arrange_poly(ModelInstance* instance, const DynamicPrintConfig& config);
+
+// The precise (possibly concave) footprint of an instance, in the frame of the
+// convex hull get_arrange_polygon() returns: the projection of its model parts minus
+// its negative volumes, without the instance's XY offset and Z rotation.
+ExPolygons get_instance_precise_outline(const ModelInstance &instance);
 }
 
 #endif // MODELARRANGE_HPP

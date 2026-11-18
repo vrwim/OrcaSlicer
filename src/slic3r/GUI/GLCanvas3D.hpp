@@ -21,6 +21,7 @@
 #include "libvgcode/include/Types.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Line.hpp"
+#include "libslic3r/Arrange.hpp"
 #include <stddef.h>
 #include <functional>
 #include <memory>
@@ -709,6 +710,7 @@ public:
 //        float distance_sla       = 6.;
         float accuracy           = 0.65f; // Unused currently
         bool  enable_rotation    = false;
+        arrangement::ArrangeGeometry geometry = arrangement::ArrangeGeometry::Fast;
         bool  allow_multi_materials_on_same_plate = true;
         bool  avoid_extrusion_cali_region = true;
         //BBS: add more arrangeSettings

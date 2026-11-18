@@ -1,6 +1,8 @@
 #include "Arrange.hpp"
 #include "ClipperUtils.hpp"
 #include "ExPolygon.hpp"
+#include "Geometry/ConvexHull.hpp"
+#include "Line.hpp"
 #include "Point.hpp"
 #include "Polygon.hpp"
 #include "Print.hpp"
@@ -15,6 +17,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <boost/geometry/algorithms/convert.hpp>
 #include <array>
 #include <boost/geometry/index/predicates.hpp>
@@ -47,6 +51,10 @@
 #include <boost/multiprecision/integer.hpp>
 #include <boost/rational.hpp>
 #include "MultiMaterialSegmentation.hpp"
+#include <earcut.hpp>
+#include <map>
+#include <tuple>
+#include <tbb/parallel_for.h>
 
 namespace libnest2d {
 #if !defined(_MSC_VER) && defined(__SIZEOF_INT128__) && !defined(__APPLE__)
@@ -383,7 +391,7 @@ void fill_config(PConf& pcfg, const ArrangeParams &params) {
         }
         else {
             // Start placing the items from the center of the print bed
-            pcfg.starting_point = PConf::Alignment::TOP_RIGHT;
+            pcfg.starting_point = params.variant.start_at_center ? PConf::Alignment::CENTER : PConf::Alignment::TOP_RIGHT;
         }
 
     if (params.do_final_align) {
@@ -393,15 +401,29 @@ void fill_config(PConf& pcfg, const ArrangeParams &params) {
         pcfg.alignment = PConf::Alignment::DONT_ALIGN;
 
 
-    // Try 4 angles (45 degree step) and find the one with min cost
-    if (params.allow_rotations)
-        pcfg.rotations = {0., PI / 4., PI/2, 3. * PI / 4. };
-    else
+    // Collide items by their precise outline. Placed items take it from Balanced
+    // up, the item being placed from Precise up.
+    const ArrangeGeometry geometry = effective_geometry(params);
+    pcfg.fixed_precise  = geometry != ArrangeGeometry::Fast;
+    pcfg.moving_precise = geometry == ArrangeGeometry::Precise || geometry == ArrangeGeometry::Exhaustive;
+    // Lookahead: Precise judges each placement by the layout after the next item too,
+    // Exhaustive after the next two.
+    pcfg.lookahead_depth = geometry == ArrangeGeometry::Exhaustive ? 3 : geometry == ArrangeGeometry::Precise ? 2 : 1;
+
+    // Try angles in 45 degree steps and keep the one with min cost. A convex hull is
+    // covered by 4 of them; interlocking outlines need the full turn.
+    if (!params.allow_rotations)
         pcfg.rotations = {0.};
+    else if (pcfg.moving_precise)
+        pcfg.rotations = {0., PI / 4., PI / 2, 3. * PI / 4., PI, 5. * PI / 4., 3. * PI / 2, 7. * PI / 4.};
+    else
+        pcfg.rotations = {0., PI / 4., PI/2, 3. * PI / 4. };
 
     // The accuracy of optimization.
     // Goes from 0.0 to 1.0 and scales performance as well
     pcfg.accuracy = params.accuracy;
+
+    pcfg.stop_condition = params.stopcondition;
 
     // Allow parallel execution.
     pcfg.parallel = params.parallel;
@@ -467,6 +489,22 @@ static double fixed_overfit_topright_sliding(const std::tuple<double, Box> &resu
 
 // A class encapsulating the libnest2d Nester class and extending it with other
 // management and spatial index structures for acceleration.
+// The area items are sorted by, largest first. With a seed, each item's area is
+// scaled by a fixed factor between 0.8 and 1.2 taken from the seed and its id, so
+// items of similar size swap places while big items still come before small ones.
+static double order_area(const Item &item, unsigned seed)
+{
+    if (seed == 0)
+        return item.area();
+    uint64_t h = (uint64_t(seed) << 32) ^ uint64_t(uint32_t(item.itemId()));
+    h += 0x9e3779b97f4a7c15ull; // splitmix64
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    h ^= h >> 31;
+    const double unit = double(h >> 11) / double(uint64_t(1) << 53);
+    return item.area() * (0.8 + 0.4 * unit);
+}
+
 template<class TBin>
 class AutoArranger {
 public:
@@ -708,8 +746,27 @@ protected:
 
                 density = std::sqrt(norm(fullbb.width()) * norm(fullbb.height()));
                 double R = double(m_remaining.size()) / m_item_count;
+
+                const bool by_outline = effective_geometry(params) != ArrangeGeometry::Fast;
+                if (by_outline) {
+                    // As PrusaSlicer's arrange kernel: measure from the item's centroid
+                    // instead of the nearest bounding box corner. Corners favour square
+                    // grids, which keeps round and concave parts apart.
+                    // The placed centroid without transforming the outline: rotation is
+                    // linear and translation adds. It leaves out the small shift that
+                    // inflation gives an asymmetric shape, which scoring does not need.
+                    const Vec2d  c   = item.rawShape().contour.centroid().cast<double>();
+                    const double sin = item.rotation().sin(), cos = item.rotation().cos();
+                    const Point  centroid = Point(coord_t(std::lround(cos * c.x() - sin * c.y())),
+                                                  coord_t(std::lround(sin * c.x() + cos * c.y()))) + item.translation();
+                    dist = (0.8 * norm(pl::distance(centroid, cc)) + 0.2 * bindist) * params.variant.distance_weight;
+                }
                 // alighment score is more important for rectangle items
                 double alignment_weight = std::max(0.3, 0.6 * item.area() / ibb.area());
+                // Bounding box alignment works against interlocking, so it only gets a
+                // light weight when nesting by the precise outline (PrusaSlicer uses 0.1).
+                if (by_outline)
+                    alignment_weight = 0.1;
 
                 // The final mix of the score is the balance between the
                 // distance from the full pile center, the pack density and
@@ -995,7 +1052,8 @@ public:
             }
             else {
                 return i1.bed_temp != i2.bed_temp ? (i1.bed_temp > i2.bed_temp) :
-                    (i1.extrude_ids != i2.extrude_ids ? (i1.extrude_ids.front() < i2.extrude_ids.front()) : (i1.area() > i2.area()));
+                    (i1.extrude_ids != i2.extrude_ids ? (i1.extrude_ids.front() < i2.extrude_ids.front()) :
+                                                        (order_area(i1, params.variant.order_seed) > order_area(i2, params.variant.order_seed)));
             }
         };
 
@@ -1243,9 +1301,192 @@ static CircleBed to_circle(const Point &center, const Points& points) {
     return ret;
 }
 
+// Tolerance for simplifying a precise outline before it is decomposed. Fewer
+// vertices mean fewer convex parts and far fewer part NFPs to compute.
+static constexpr double PRECISE_OUTLINE_SIMPLIFY_MM = 1.0;
+
+// How far the original outline sticks out of its simplification: the largest
+// distance from an original vertex outside it to its boundary. Douglas-Peucker
+// keeps a subset of the vertices, so every original edge between two kept ones
+// lies within this distance of the chord that replaced it.
+static double simplification_deviation(const ExPolygons &original, const ExPolygons &simplified)
+{
+    const Lines boundary = to_lines(simplified);
+    double      worst    = 0.;
+    for (const Point &p : to_points(original)) {
+        if (std::any_of(simplified.begin(), simplified.end(), [&p](const ExPolygon &e) { return e.contains(p); }))
+            continue;
+        double d = std::numeric_limits<double>::max();
+        for (const Line &l : boundary)
+            d = std::min(d, l.distance_to(p));
+        worst = std::max(worst, d);
+    }
+    return worst;
+}
+
+// The precise outline, simplified and then grown by exactly what the
+// simplification cut off, so it covers the object. Straight-sided outlines lose
+// nothing and keep their size.
+static ExPolygons simplified_outline(const ExPolygons &outline)
+{
+    ExPolygons   simplified = expolygons_simplify(outline, scaled(PRECISE_OUTLINE_SIMPLIFY_MM));
+    const double deviation  = simplification_deviation(outline, simplified);
+    return deviation > 0. ? offset_ex(simplified, float(deviation) + SCALED_EPSILON, jtMiter, 3.) : simplified;
+}
+
+// Cover an outline with convex polygons, as PrusaSlicer does for its accurate
+// arrange: triangulate it, then merge triangles across their shared edges while the
+// result stays convex (Hertel-Mehlhorn). PrusaSlicer keeps the bare triangles; merging
+// them gives far fewer parts, and every NFP pair costs parts(a) * parts(b).
+// The parts cover exactly the outline, holes stay free.
+static Polygons convex_decomposition(const ExPolygons &outline)
+{
+    Polygons ret;
+    for (const ExPolygon &expoly : outline) {
+        if (expoly.contour.size() < 3)
+            continue;
+        if (expoly.holes.empty() && polygon_is_convex(expoly.contour)) {
+            ret.emplace_back(expoly.contour);
+            continue;
+        }
+
+        // Triangulate by vertex index, so neighbouring triangles share exact vertices.
+        std::vector<std::vector<std::array<coord_t, 2>>> rings;
+        std::vector<Point>                               pts;
+        auto add_ring = [&](const Polygon &p) {
+            auto &ring = rings.emplace_back();
+            ring.reserve(p.size());
+            for (const Point &pt : p.points) {
+                ring.push_back({pt.x(), pt.y()});
+                pts.emplace_back(pt);
+            }
+        };
+        add_ring(expoly.contour);
+        for (const Polygon &h : expoly.holes)
+            add_ring(h);
+        const std::vector<uint32_t> idx = mapbox::earcut<uint32_t>(rings);
+
+        // Convex polygons as counter-clockwise index rings.
+        std::vector<std::vector<uint32_t>> polys;
+        polys.reserve(idx.size() / 3);
+        auto cross = [&pts](uint32_t a, uint32_t b, uint32_t c) {
+            const Vec2d u = (pts[b] - pts[a]).cast<double>(), v = (pts[c] - pts[b]).cast<double>();
+            return u.x() * v.y() - u.y() * v.x();
+        };
+        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+            std::vector<uint32_t> tri{idx[i], idx[i + 1], idx[i + 2]};
+            double c = cross(tri[0], tri[1], tri[2]);
+            if (c == 0.)
+                continue; // degenerate
+            if (c < 0.)
+                std::swap(tri[1], tri[2]);
+            polys.emplace_back(std::move(tri));
+        }
+
+        // Directed edge -> polygon owning it.
+        std::map<std::pair<uint32_t, uint32_t>, size_t> owner;
+        for (size_t pi = 0; pi < polys.size(); ++pi)
+            for (size_t k = 0; k < polys[pi].size(); ++k)
+                owner[{polys[pi][k], polys[pi][(k + 1) % polys[pi].size()]}] = pi;
+
+        std::vector<bool> alive(polys.size(), true);
+        std::vector<std::pair<uint32_t, uint32_t>> diagonals;
+        for (const auto &[edge, pi] : owner)
+            if (edge.first < edge.second && owner.count({edge.second, edge.first}))
+                diagonals.push_back(edge);
+
+        for (const auto &[a, b] : diagonals) {
+            auto ip = owner.find({a, b}), iq = owner.find({b, a});
+            if (ip == owner.end() || iq == owner.end())
+                continue;
+            const size_t P = ip->second, Q = iq->second;
+            if (P == Q || !alive[P] || !alive[Q])
+                continue;
+            const std::vector<uint32_t> &pp = polys[P], &qq = polys[Q];
+            const size_t np = pp.size(), nq = qq.size();
+            size_t i = 0, j = 0;
+            while (i < np && !(pp[i] == a && pp[(i + 1) % np] == b)) ++i;
+            while (j < nq && !(qq[j] == b && qq[(j + 1) % nq] == a)) ++j;
+            if (i == np || j == nq)
+                continue;
+
+            // Walk P from b all the way round to a, then Q from after a to before b.
+            std::vector<uint32_t> merged;
+            merged.reserve(np + nq - 2);
+            for (size_t k = 0; k < np; ++k)
+                merged.push_back(pp[(i + 1 + k) % np]);
+            for (size_t k = 2; k < nq; ++k)
+                merged.push_back(qq[(j + k) % nq]);
+
+            // Both parts are convex, so only the corners at a and b can turn the wrong way.
+            const size_t n = merged.size();
+            auto convex_at = [&](size_t k) { return cross(merged[(k + n - 1) % n], merged[k], merged[(k + 1) % n]) >= 0.; };
+            const size_t ka = np - 1, kb = 0; // positions of a and b in merged
+            if (!convex_at(ka) || !convex_at(kb))
+                continue;
+
+            owner.erase({a, b});
+            owner.erase({b, a});
+            for (size_t k = 0; k < n; ++k) {
+                auto e = std::make_pair(merged[k], merged[(k + 1) % n]);
+                auto it = owner.find(e);
+                if (it != owner.end() && (it->second == P || it->second == Q))
+                    it->second = P;
+            }
+            polys[P] = std::move(merged);
+            alive[Q] = false;
+            polys[Q].clear();
+        }
+
+        for (size_t pi = 0; pi < polys.size(); ++pi) {
+            if (!alive[pi])
+                continue;
+            Polygon part;
+            part.points.reserve(polys[pi].size());
+            for (uint32_t v : polys[pi])
+                part.points.emplace_back(pts[v]);
+            part.remove_duplicate_points();
+            if (part.size() >= 3)
+                ret.emplace_back(std::move(part));
+        }
+    }
+    return ret;
+}
+
+// The smallest of 45, 90 and 180 degrees by which the shape can be turned about its
+// centroid and still cover the same area, to 0.5%; a full turn if none does. Arrange
+// tries only one rotation of each class of equivalent ones.
+static double rotation_period(const ExPolygons &shape)
+{
+    // Holes run opposite to their contour, so signed areas subtract them.
+    double signed_area = 0.;
+    Vec2d  moment(0., 0.);
+    for (const Polygon &p : to_polygons(shape)) {
+        const double a = p.area();
+        signed_area += a;
+        moment += a * p.centroid().cast<double>();
+    }
+    const double area = std::abs(signed_area);
+    if (area <= 0.)
+        return 2. * PI;
+    const Point center = (moment / signed_area).cast<coord_t>();
+
+    for (const double period : {PI / 4., PI / 2., PI}) {
+        ExPolygons turned = shape;
+        for (ExPolygon &e : turned)
+            e.rotate(period, center);
+        const double xor_area = Slic3r::area(diff_ex(shape, turned)) + Slic3r::area(diff_ex(turned, shape));
+        if (xor_area < 0.005 * area)
+            return period;
+    }
+    return 2. * PI;
+}
+
 // Create Item from Arrangeable
 static void process_arrangeable(const ArrangePolygon &arrpoly,
-                                std::vector<Item> &   outp)
+                                std::vector<Item> &   outp,
+                                bool                  precise = false,
+                                bool                  rotates = false)
 {
     Polygon        p        = arrpoly.poly.contour;
     const Vec2crd &offs     = arrpoly.translation;
@@ -1280,6 +1521,30 @@ static void process_arrangeable(const ArrangePolygon &arrpoly,
     item.vitrify_temp = arrpoly.vitrify_temp;
     item.inflation(arrpoly.inflation);
     item.filament_temp_type = arrpoly.filament_temp_type;
+
+    if (!precise)
+        return;
+
+    // The shape the item collides with: its outline when that is worth decomposing,
+    // its convex hull otherwise.
+    ExPolygons collision{item.rawShape()};
+    if (!arrpoly.outline.empty()) {
+        ExPolygons outline = simplified_outline(arrpoly.outline);
+        Polygons   parts   = convex_decomposition(outline);
+        // Only worth it if the outline is not convex already.
+        if (parts.size() > 1 || (parts.size() == 1 && std::abs(parts.front().area()) < 0.98 * std::abs(item.rawShape().contour.area()))) {
+            std::vector<ExPolygon> ex_parts;
+            ex_parts.reserve(parts.size());
+            for (Polygon &p : parts) {
+                if (p.is_counter_clockwise()) p.reverse(); // like the main shape above
+                ex_parts.emplace_back(std::move(p));
+            }
+            item.convexParts(std::move(ex_parts));
+            collision = std::move(outline);
+        }
+    }
+    if (rotates)
+        item.rotationPeriod(rotation_period(collision));
 }
 
 template<class Fn> auto call_with_bed(const Points &bed, Fn &&fn)
@@ -1314,19 +1579,21 @@ void arrange(ArrangePolygons &      items,
 }
 
 template<class BedT>
-void arrange(ArrangePolygons &      arrangables,
-             const ArrangePolygons &excludes,
-             const BedT &           bed,
-             const ArrangeParams &  params)
+static void arrange_once(ArrangePolygons &      arrangables,
+                         const ArrangePolygons &excludes,
+                         const BedT &           bed,
+                         const ArrangeParams &  params)
 {
     std::vector<Item> items, fixeditems;
     items.reserve(arrangables.size());
 
+    const bool precise = effective_geometry(params) != ArrangeGeometry::Fast;
+
     for (ArrangePolygon &arrangeable : arrangables)
-        process_arrangeable(arrangeable, items);
+        process_arrangeable(arrangeable, items, precise, params.allow_rotations);
 
     for (const ArrangePolygon &fixed: excludes)
-        process_arrangeable(fixed, fixeditems);
+        process_arrangeable(fixed, fixeditems, precise);
 
     for (Item &itm : fixeditems) itm.inflate(scaled(-2. * EPSILON));
 
@@ -1339,6 +1606,106 @@ void arrange(ArrangePolygons &      arrangables,
         arrangables[i].bed_idx     = items[i].binId();
         arrangables[i].itemid      = items[i].itemId();  // arrange order is useful for sequential printing
     }
+}
+
+// How good a whole arrangement is, lower first: items left unplaced, beds used,
+// items not on bed 0, then the area of the convex hull of bed 0's pile.
+static std::tuple<int, int, int, double> arrangement_cost(const ArrangePolygons &arranged)
+{
+    int    unplaced = 0, beds = 0, off_bed0 = 0;
+    Points pile;
+    for (const ArrangePolygon &ap : arranged) {
+        if (ap.bed_idx < 0) {
+            ++unplaced;
+            continue;
+        }
+        beds = std::max(beds, ap.bed_idx + 1);
+        if (ap.bed_idx == 0)
+            append(pile, ap.transformed_poly().contour.points);
+        else
+            ++off_bed0;
+    }
+    return {unplaced, beds, off_bed0, std::abs(Geometry::convex_hull(std::move(pile)).area())};
+}
+
+// The complete arrangements a level runs, its own first. Every level above Fast also
+// runs the levels below it, so it is never worse than any of them. Exhaustive adds
+// runs that look one item deeper, place items of similar size in another order, weigh
+// the pull to the pile's center differently or start the pile at the bed's center.
+// The list is fixed, so the result does not depend on the machine's core count.
+static std::vector<ArrangeParams> level_runs(const ArrangeParams &params)
+{
+    using V       = ArrangeParams::Variant;
+    const auto at = [&params](ArrangeGeometry g, V v = V{}) {
+        ArrangeParams p = params;
+        p.geometry      = g;
+        p.variant       = v;
+        return p;
+    };
+    switch (effective_geometry(params)) {
+    case ArrangeGeometry::Fast: return {at(ArrangeGeometry::Fast)};
+    case ArrangeGeometry::Balanced: return {at(ArrangeGeometry::Balanced), at(ArrangeGeometry::Fast)};
+    case ArrangeGeometry::Precise: return {at(ArrangeGeometry::Precise), at(ArrangeGeometry::Balanced), at(ArrangeGeometry::Fast)};
+    case ArrangeGeometry::Exhaustive: {
+        // Each of these won on at least one benchmark plate; looking 3 deep with
+        // reordered items, and Precise starting at the center, never did.
+        const V reordered{1, 1., false}, closer{0, 0.8, false}, tighter{0, 1.2, false}, centered{0, 1., true};
+        return {at(ArrangeGeometry::Exhaustive),         at(ArrangeGeometry::Precise),
+                at(ArrangeGeometry::Precise, reordered),  at(ArrangeGeometry::Exhaustive, closer),
+                at(ArrangeGeometry::Precise, closer),     at(ArrangeGeometry::Exhaustive, tighter),
+                at(ArrangeGeometry::Precise, tighter),    at(ArrangeGeometry::Exhaustive, centered),
+                at(ArrangeGeometry::Balanced),            at(ArrangeGeometry::Fast)};
+    }
+    }
+    return {params};
+}
+
+// Runs the level's arrangements in parallel and keeps the best by arrangement_cost,
+// the earlier run on a tie. The first run reports progress. A cancel stops every run,
+// and the best one so far is kept.
+template<class BedT>
+static void arrange_best_of(ArrangePolygons &      arrangables,
+                            const ArrangePolygons &excludes,
+                            const BedT &           bed,
+                            const ArrangeParams &  params)
+{
+    const std::vector<ArrangeParams> levels = level_runs(params);
+    std::vector<ArrangePolygons>     runs(levels.size(), arrangables);
+    tbb::parallel_for(size_t(0), levels.size(), [&](size_t r) {
+        ArrangeParams p = levels[r];
+        if (r != 0) {
+            p.progressind = nullptr;
+            p.on_packed   = nullptr;
+        }
+        if (p.variant.order_seed != 0)
+            for (size_t i = 0; i < runs[r].size(); ++i)
+                runs[r][i].itemid = int(i);
+        arrange_once(runs[r], excludes, bed, p);
+    });
+
+    size_t best = 0;
+    for (size_t r = 1; r < runs.size(); ++r)
+        if (arrangement_cost(runs[r]) < arrangement_cost(runs[best]))
+            best = r;
+    for (size_t i = 0; i < arrangables.size(); ++i) {
+        arrangables[i].translation = runs[best][i].translation;
+        arrangables[i].rotation    = runs[best][i].rotation;
+        arrangables[i].bed_idx     = runs[best][i].bed_idx;
+        arrangables[i].itemid      = runs[best][i].itemid;
+    }
+}
+
+template<class BedT>
+void arrange(ArrangePolygons &      arrangables,
+             const ArrangePolygons &excludes,
+             const BedT &           bed,
+             const ArrangeParams &  params)
+{
+    // Fast is Orca's original arrange: one run, unchanged.
+    if (effective_geometry(params) == ArrangeGeometry::Fast)
+        arrange_once(arrangables, excludes, bed, params);
+    else
+        arrange_best_of(arrangables, excludes, bed, params);
 }
 
 template void arrange(ArrangePolygons &items, const ArrangePolygons &excludes, const BoundingBox &bed, const ArrangeParams &params);

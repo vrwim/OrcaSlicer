@@ -17,6 +17,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
@@ -29,6 +30,7 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Geometry/ConvexHull.hpp"
+#include "libslic3r/Line.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/MultiMaterialSegmentation.hpp"
@@ -751,14 +753,18 @@ TEST_CASE("Arrange keeps relevant objects outside conditional exclusion obstacle
     require_no_overlap(items);
 }
 
-// Benchmark plates: generated shapes, arranged by their convex hull, on a 256 mm bed with
-// 2 mm spacing.
+// Geometry levels. Plates of generated shapes, each with its real outline and its convex
+// hull as the arrange polygon, on a 256 mm bed with 2 mm spacing.
 namespace {
 
 constexpr double BED_MM     = 256.;
 constexpr double SPACING_MM = 2.;
-// Slack for the gap check: integer rounding.
+// Slack for the gap check: the outline simplification and integer rounding.
 constexpr double GAP_SLACK_MM = 0.05;
+
+using Level = ArrangeGeometry;
+
+const char *level_name(Level l) { return arrange_geometry_name(l); }
 
 Polygon circle(double r_mm)
 {
@@ -798,10 +804,11 @@ ExPolygon shape_ring(double R, double r)
     return ring;
 }
 
-ArrangePolygon make_item(const ExPolygon &shape)
+ArrangePolygon make_item(const ExPolygon &outline)
 {
     ArrangePolygon ap;
-    ap.poly      = ExPolygon(Geometry::convex_hull(shape.contour.points));
+    ap.outline   = {outline};
+    ap.poly      = ExPolygon(Geometry::convex_hull(outline.contour.points));
     ap.inflation = scaled(SPACING_MM / 2.);
     ap.bed_idx   = 0;
     ap.height    = 10.;
@@ -835,56 +842,216 @@ Scenario scenario(const std::string &name)
 
 const std::vector<std::string> ALL_SCENARIOS = {"cyl30", "cap-cyl", "L16", "cap-L", "C20", "mixed24", "cap-mixed", "rings", "rings-big"};
 
+ArrangePolygons scenario_items(const std::string &name)
+{
+    ArrangePolygons items;
+    for (const ExPolygon &e : scenario(name).shapes)
+        items.emplace_back(make_item(e));
+    return items;
+}
+
+ArrangeParams level_params(Level level, bool rotations)
+{
+    ArrangeParams p   = quiet_params();
+    p.allow_rotations = rotations;
+    p.geometry        = level;
+    return p;
+}
+
 struct Run
 {
     ArrangePolygons items;
     double          seconds = 0.;
 };
 
-Run run_arrange(const std::string &name, bool rotations)
+Run run_arrange(const std::string &name, Level level, bool rotations)
 {
-    Run r;
-    for (const ExPolygon &e : scenario(name).shapes)
-        r.items.emplace_back(make_item(e));
-    ArrangeParams p   = quiet_params();
-    p.allow_rotations = rotations;
-    const auto t0     = std::chrono::steady_clock::now();
-    arrange(r.items, bed(BED_MM, BED_MM), p);
+    Run        r{scenario_items(name)};
+    const auto t0 = std::chrono::steady_clock::now();
+    arrange(r.items, bed(BED_MM, BED_MM), level_params(level, rotations));
     r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return r;
 }
 
-// Items on one bed stay at least spacing - slack apart, and items on bed 0 inside the bed.
-// Growing both shapes by half of that with round joins makes them touch exactly at that
-// distance; miter joins would report false violations at diagonal corners.
-void require_valid_layout(const ArrangePolygons &items)
+// Arranges the plate with a stop condition that never stops, and returns how often it was
+// asked. It is asked once per rotation an item is tried at.
+int stop_polls(ArrangePolygons &items, Level level, bool rotations)
 {
-    const ExPolygons  placed = placed_shapes(items);
-    const float       half_gap = float(scaled((SPACING_MM - GAP_SLACK_MM) / 2.));
-    const double      tiny     = scaled(0.01) * scaled(0.01);
-    const BoundingBox bed_area(Point(-scaled(0.01), -scaled(0.01)), Point(scaled(BED_MM + 0.01), scaled(BED_MM + 0.01)));
-    std::vector<ExPolygons> grown;
-    for (const ExPolygon &e : placed)
-        grown.emplace_back(offset_ex(e, half_gap, jtRound));
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].bed_idx == 0)
-            CHECK(bed_area.contains(get_extents(placed[i])));
-        for (size_t j = i + 1; j < items.size(); ++j)
-            if (items[i].bed_idx == items[j].bed_idx && items[i].bed_idx >= 0) {
-                INFO("items " << i << " and " << j);
-                CHECK(area(intersection_ex(grown[i], grown[j])) <= tiny);
-            }
-    }
+    ArrangeParams p = level_params(level, rotations);
+    int           polls = 0;
+    p.stopcondition     = [&polls] { ++polls; return false; };
+    arrange(items, bed(BED_MM, BED_MM), p);
+    return polls;
 }
 
-int on_bed0(const ArrangePolygons &items)
+ExPolygons placed_outline(const ArrangePolygon &ap)
 {
-    return int(std::count_if(items.begin(), items.end(), [](const ArrangePolygon &ap) { return ap.bed_idx == 0; }));
+    ExPolygons out = ap.outline;
+    for (ExPolygon &e : out) {
+        e.rotate(ap.rotation);
+        e.translate(ap.translation.x(), ap.translation.y());
+    }
+    return out;
+}
+
+// Every pair on one bed must stay at least spacing - slack apart. Growing both outlines by
+// half of that with round joins makes them touch exactly at that distance; miter joins would
+// report false violations at diagonal corners.
+struct Violations
+{
+    int         overlaps = 0, gaps = 0, outside = 0;
+    std::string first;
+};
+
+Violations check_layout(const ArrangePolygons &items)
+{
+    Violations v;
+    std::vector<ExPolygons>  placed, grown;
+    std::vector<BoundingBox> bbs;
+    const float              half_gap = float(scaled((SPACING_MM - GAP_SLACK_MM) / 2.));
+    for (const ArrangePolygon &ap : items) {
+        placed.emplace_back(placed_outline(ap));
+        grown.emplace_back(offset_ex(placed.back(), half_gap, jtRound));
+        bbs.emplace_back(get_extents(grown.back()));
+    }
+    const double      tiny = scaled(0.01) * scaled(0.01);
+    const BoundingBox bed_area(Point(-scaled(0.01), -scaled(0.01)), Point(scaled(BED_MM + 0.01), scaled(BED_MM + 0.01)));
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].bed_idx == 0 && !bed_area.contains(get_extents(placed[i]))) {
+            ++v.outside;
+            if (v.first.empty()) v.first = "item " + std::to_string(i) + " outside bed";
+        }
+        for (size_t j = i + 1; j < items.size(); ++j) {
+            if (items[i].bed_idx != items[j].bed_idx || items[i].bed_idx < 0 || !bbs[i].overlap(bbs[j]))
+                continue;
+            if (area(intersection_ex(placed[i], placed[j])) > tiny) {
+                ++v.overlaps;
+                if (v.first.empty()) v.first = "items " + std::to_string(i) + "," + std::to_string(j) + " overlap";
+            } else if (area(intersection_ex(grown[i], grown[j])) > tiny) {
+                ++v.gaps;
+                if (v.first.empty()) v.first = "items " + std::to_string(i) + "," + std::to_string(j) + " closer than spacing";
+            }
+        }
+    }
+    return v;
+}
+
+void require_valid_layout(const ArrangePolygons &items)
+{
+    const Violations v = check_layout(items);
+    INFO(v.first);
+    CHECK(v.overlaps == 0);
+    CHECK(v.gaps == 0);
+    CHECK(v.outside == 0);
+}
+
+struct Metrics
+{
+    int    on_bed0 = 0;
+    double pile_w = 0, pile_h = 0;
+};
+
+Metrics metrics(const ArrangePolygons &items)
+{
+    Metrics     m;
+    BoundingBox bb;
+    for (const ArrangePolygon &ap : items)
+        if (ap.bed_idx == 0) {
+            ++m.on_bed0;
+            bb.merge(get_extents(placed_outline(ap)));
+        }
+    if (bb.defined) {
+        m.pile_w = unscaled(bb.size().x());
+        m.pile_h = unscaled(bb.size().y());
+    }
+    return m;
+}
+
+// Area of the convex hull of everything on bed 0.
+double pile_hull_area_mm2(const ArrangePolygons &items)
+{
+    Points pts;
+    for (const ArrangePolygon &ap : items)
+        if (ap.bed_idx == 0)
+            append(pts, to_points(placed_outline(ap)));
+    return std::abs(Geometry::convex_hull(pts).area()) * SCALING_FACTOR * SCALING_FACTOR;
+}
+
+// How good a whole arrangement is: fewer items left unplaced, then fewer beds, then more
+// items on bed 0, then a smaller pile hull on bed 0.
+std::tuple<int, int, int, double> arrangement_cost(const ArrangePolygons &items)
+{
+    int unplaced = 0, beds = 0;
+    for (const ArrangePolygon &ap : items) {
+        if (ap.bed_idx < 0) ++unplaced;
+        else beds = std::max(beds, ap.bed_idx + 1);
+    }
+    return {unplaced, beds, -metrics(items).on_bed0, pile_hull_area_mm2(items)};
+}
+
+// Discs lying entirely inside the hole of a placed ring.
+int discs_in_ring_holes(const ArrangePolygons &items)
+{
+    Polygons holes;
+    for (const ArrangePolygon &ap : items)
+        if (ap.bed_idx == 0)
+            for (const ExPolygon &e : placed_outline(ap))
+                holes.insert(holes.end(), e.holes.begin(), e.holes.end());
+    const auto in_a_hole = [&holes](const Polygon &disc) {
+        return std::any_of(holes.begin(), holes.end(), [&disc](const Polygon &h) { return diff(Polygons{disc}, Polygons{h}).empty(); });
+    };
+    return int(std::count_if(items.begin(), items.end(), [&](const ArrangePolygon &ap) {
+        return ap.bed_idx == 0 && ap.outline.front().holes.empty() && in_a_hole(placed_outline(ap).front().contour);
+    }));
+}
+
+// Distance between two disjoint outlines: the closest vertex of one to an edge of the other.
+double outline_distance(const ExPolygons &a, const ExPolygons &b)
+{
+    double     best  = std::numeric_limits<double>::max();
+    const auto sweep = [&best](const ExPolygons &from, const ExPolygons &to) {
+        const Lines edges = to_lines(to);
+        for (const Point &p : to_points(from))
+            for (const Line &l : edges) best = std::min(best, l.distance_to(p));
+    };
+    sweep(a, b);
+    sweep(b, a);
+    return unscaled(best);
+}
+
+// The gap between the two closest items on bed 0.
+double closest_gap_mm(const ArrangePolygons &items)
+{
+    double best = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < items.size(); ++i)
+        for (size_t j = i + 1; j < items.size(); ++j)
+            if (items[i].bed_idx == 0 && items[j].bed_idx == 0)
+                best = std::min(best, outline_distance(placed_outline(items[i]), placed_outline(items[j])));
+    return best;
+}
+
+// Items on bed 0 whose outline reaches into another item's pocket (its convex hull minus
+// its outline) by at least min_area_mm2.
+int interlocked_items(const ArrangePolygons &items, double min_area_mm2)
+{
+    std::vector<ExPolygons> outline, pocket;
+    for (const ArrangePolygon &ap : items) {
+        outline.emplace_back(ap.bed_idx == 0 ? placed_outline(ap) : ExPolygons{});
+        pocket.emplace_back(diff_ex(ExPolygons{ExPolygon(Geometry::convex_hull(to_points(outline.back())))}, outline.back()));
+    }
+    int n = 0;
+    for (size_t i = 0; i < items.size(); ++i)
+        for (size_t j = 0; j < items.size(); ++j)
+            if (i != j && Slic3r::area(intersection_ex(outline[i], pocket[j])) >= scaled(1.) * scaled(1.) * min_area_mm2) {
+                ++n;
+                break;
+            }
+    return n;
 }
 
 std::string golden_path() { return std::string(TEST_DATA_DIR) + "/arrange_fast_golden.txt"; }
 
-std::string layout_dump(const std::string &name, bool rot, const ArrangePolygons &items)
+std::string fast_layout_dump(const std::string &name, bool rot, const ArrangePolygons &items)
 {
     std::ostringstream os;
     for (size_t i = 0; i < items.size(); ++i)
@@ -902,7 +1069,40 @@ std::vector<std::string> lines_of(const std::string &s, const std::string &prefi
     return out;
 }
 
-// Runs per plate, ORCA_ARRANGE_BENCH_REPEAT (default 1); the fastest time is kept, as a
+std::string bench_csv_path()
+{
+    const char *p = std::getenv("ORCA_ARRANGE_BENCH_CSV");
+    return p ? p : "arrange_bench.csv";
+}
+
+void write_bench_line(const std::string &scenario, Level level, bool rot, const Run &r, const Metrics &m)
+{
+    static bool truncated = false;
+    std::ofstream f(bench_csv_path(), truncated ? std::ios::app : std::ios::trunc);
+    if (!truncated) {
+        f << "scenario,geometry,rotate,items,on_bed0,pile_w_mm,pile_h_mm,seconds\n";
+        truncated = true;
+    }
+    char line[256];
+    std::snprintf(line, sizeof line, "%s,%s,%d,%zu,%d,%.1f,%.1f,%.3f", scenario.c_str(), level_name(level), int(rot),
+                  r.items.size(), m.on_bed0, m.pile_w, m.pile_h, r.seconds);
+    f << line << "\n";
+    std::cout << "arrange-bench " << line << std::endl;
+}
+
+// Levels to benchmark: ORCA_ARRANGE_BENCH_LEVELS="fast,precise", all but Exhaustive by default.
+std::vector<Level> bench_levels()
+{
+    const char *sel = std::getenv("ORCA_ARRANGE_BENCH_LEVELS");
+    const std::string s = sel ? sel : "fast,balanced,precise";
+    std::vector<Level> out;
+    for (Level l : {Level::Fast, Level::Balanced, Level::Precise, Level::Exhaustive})
+        if (("," + s + ",").find("," + std::string(level_name(l)) + ",") != std::string::npos)
+            out.push_back(l);
+    return out;
+}
+
+// Runs per scenario, ORCA_ARRANGE_BENCH_REPEAT (default 1); the fastest time is kept, as a
 // laptop's run-to-run noise exceeds most single optimisations.
 int bench_repeats()
 {
@@ -912,17 +1112,156 @@ int bench_repeats()
 
 } // namespace
 
-// The arrange's layouts must not change. Regenerate the file with ORCA_WRITE_ARRANGE_GOLDEN=1
-// only when that behaviour is changed on purpose.
-TEST_CASE("Arrange gives the recorded layouts", "[Arrange][Golden]")
+TEST_CASE("Every geometry level keeps items apart and on the bed", "[Arrange][ArrangeGeometry]")
+{
+    const std::string name   = GENERATE(as<std::string>{}, "cyl30", "L16", "C20", "mixed24", "rings");
+    const Level       level  = GENERATE(Level::Fast, Level::Balanced, Level::Precise);
+    const bool        rotate = GENERATE(false, true);
+    DYNAMIC_SECTION(name << " " << level_name(level) << " rotate=" << rotate)
+    {
+        require_valid_layout(run_arrange(name, level, rotate).items);
+    }
+}
+
+TEST_CASE("Precise arrange nests concave parts tighter than the convex hull does", "[Arrange][ArrangeGeometry]")
+{
+    const int fast = metrics(run_arrange("cap-L", Level::Fast, false).items).on_bed0;
+    const Run prec = run_arrange("cap-L", Level::Precise, false);
+    require_valid_layout(prec.items);
+    CHECK(metrics(prec.items).on_bed0 > fast);
+}
+
+TEST_CASE("Arrange geometry levels read back from their stored names", "[Arrange][ArrangeGeometry]")
+{
+    const Level level = GENERATE(Level::Fast, Level::Balanced, Level::Precise, Level::Exhaustive);
+    CHECK(arrange_geometry_from_name(arrange_geometry_name(level)) == level);
+    CHECK(arrange_geometry_from_name("no such level") == Level::Fast);
+}
+
+TEST_CASE("Printing by object arranges by convex hulls at every level", "[Arrange][ArrangeGeometry]")
+{
+    ArrangeParams p;
+    p.geometry     = Level::Precise;
+    p.is_seq_print = true;
+    CHECK(effective_geometry(p) == Level::Fast);
+    p.is_seq_print = false;
+    CHECK(effective_geometry(p) == Level::Precise);
+}
+
+// A Precise item can take seconds per rotation, so cancelling must not wait for all of them.
+TEST_CASE("Precise arrange checks for cancel before every rotation it tries", "[Arrange][ArrangeGeometry]")
+{
+    ArrangePolygons items = scenario_items("C20");
+    // Precise tries 8 rotations for every item after the first.
+    CHECK(stop_polls(items, Level::Precise, true) >= int(items.size() - 1) * 8);
+}
+
+// A disc looks the same at every 45 degree step, so trying it at 8 angles is wasted work.
+TEST_CASE("Precise arrange tries a disc at one angle only", "[Arrange][ArrangeGeometry]")
+{
+    ArrangePolygons layout = scenario_items("cyl30"), unrotated = scenario_items("cyl30");
+    const int       with_rotation = stop_polls(layout, Level::Precise, true);
+    const int       one_angle     = stop_polls(unrotated, Level::Precise, false);
+    require_valid_layout(layout);
+    // Precise also runs Balanced and Fast. Without rotation each tries every item at one angle.
+    // With it, Fast tries 4 angles (3 more polls per item; it has no symmetry check), while
+    // Precise's 8 and Balanced's 4 angles would add 10 more per item without one.
+    CHECK(with_rotation <= one_angle + 4 * int(layout.size()));
+}
+
+TEST_CASE("Balanced arrange places small discs inside the holes of rings", "[Arrange][ArrangeGeometry]")
+{
+    CHECK(discs_in_ring_holes(run_arrange("rings", Level::Fast, false).items) == 0);
+    const Run balanced = run_arrange("rings", Level::Balanced, false);
+    require_valid_layout(balanced.items);
+    CHECK(discs_in_ring_holes(balanced.items) > 0);
+}
+
+// Straight-sided outlines lose nothing to simplification, so they get no margin on top of
+// the spacing and nest as tight as the spacing allows.
+TEST_CASE("Precise arrange packs straight-sided parts at the set spacing", "[Arrange][ArrangeGeometry]")
+{
+    const std::string name = GENERATE(as<std::string>{}, "L16", "C20");
+    DYNAMIC_SECTION(name)
+    {
+        const Run r = run_arrange(name, Level::Precise, false);
+        require_valid_layout(r.items);
+        CHECK(closest_gap_mm(r.items) <= SPACING_MM + 0.1);
+    }
+}
+
+// Interlocking C shapes only pays off when it makes the whole pile smaller. Lookahead judges
+// each placement by the layout it leads to, where a greedy placer hooks parts together
+// wherever that scores best for one item.
+TEST_CASE("Precise arrange interlocks C shapes into a smaller pile than Fast", "[Arrange][ArrangeGeometry]")
+{
+    const Run fast    = run_arrange("C20", Level::Fast, true);
+    const Run precise = run_arrange("C20", Level::Precise, true);
+    require_valid_layout(precise.items);
+    CHECK(metrics(precise.items).on_bed0 >= metrics(fast.items).on_bed0);
+    // An arm is 10 mm wide; 100 mm2 is a real hook, not a corner graze.
+    CHECK(interlocked_items(precise.items, 100.) >= 4);
+    CHECK(pile_hull_area_mm2(precise.items) < pile_hull_area_mm2(fast.items));
+}
+
+// A slower level must not undo what a faster one achieves on the same plate.
+TEST_CASE("Each geometry level is never worse than the one below it", "[Arrange][ArrangeGeometry]")
+{
+    const std::string name   = GENERATE(as<std::string>{}, "cyl30", "cap-cyl", "L16", "cap-L", "C20", "mixed24", "cap-mixed",
+                                      "rings", "rings-big");
+    const bool        rotate = GENERATE(false, true);
+    DYNAMIC_SECTION(name << " rotate=" << rotate)
+    {
+        const auto fast     = arrangement_cost(run_arrange(name, Level::Fast, rotate).items);
+        const auto balanced = arrangement_cost(run_arrange(name, Level::Balanced, rotate).items);
+        const auto precise  = arrangement_cost(run_arrange(name, Level::Precise, rotate).items);
+        INFO("items on bed 0: fast " << -std::get<2>(fast) << ", balanced " << -std::get<2>(balanced) << ", precise "
+                                     << -std::get<2>(precise));
+        CHECK(balanced <= fast);
+        CHECK(precise <= balanced);
+    }
+}
+
+// Hidden from the default run: Exhaustive takes up to half a minute per plate, which would
+// add over a minute to every ctest. Run with libslic3r_tests "[ArrangeSlow]".
+TEST_CASE("Exhaustive arrange is never worse than Precise", "[Arrange][ArrangeGeometry][ArrangeSlow][.]")
+{
+    const std::string name   = GENERATE(as<std::string>{}, "cap-mixed", "cap-L", "C20", "mixed24");
+    const bool        rotate = GENERATE(false, true);
+    DYNAMIC_SECTION(name << " rotate=" << rotate)
+    {
+        const Run precise    = run_arrange(name, Level::Precise, rotate);
+        const Run exhaustive = run_arrange(name, Level::Exhaustive, rotate);
+        require_valid_layout(exhaustive.items);
+        const auto p = arrangement_cost(precise.items), e = arrangement_cost(exhaustive.items);
+        INFO("precise " << -std::get<2>(p) << " on bed 0, exhaustive " << -std::get<2>(e));
+        CHECK(e <= p);
+    }
+}
+
+// Exhaustive's other runs (scoring weights, starting point, item order) must find layouts
+// Precise misses, or the extra time buys nothing. Hidden from the default run for the same
+// reason as the test above.
+TEST_CASE("Exhaustive arrange fits more items than Precise on crowded plates", "[Arrange][ArrangeGeometry][ArrangeSlow][.]")
+{
+    const auto [name, rotate] = GENERATE(table<std::string, bool>({{"cap-L", false}, {"cap-mixed", true}}));
+    DYNAMIC_SECTION(name << " rotate=" << rotate)
+    {
+        const Run precise    = run_arrange(name, Level::Precise, rotate);
+        const Run exhaustive = run_arrange(name, Level::Exhaustive, rotate);
+        require_valid_layout(exhaustive.items);
+        CHECK(metrics(exhaustive.items).on_bed0 > metrics(precise.items).on_bed0);
+    }
+}
+
+// Fast is Orca's original arrange. Its layouts must not change. Regenerate the file with
+// ORCA_WRITE_ARRANGE_GOLDEN=1 only when that behaviour is changed on purpose.
+TEST_CASE("Fast arrange gives the recorded layouts", "[Arrange][Golden]")
 {
     std::string all;
     for (const std::string &name : ALL_SCENARIOS)
-        for (bool rot : {false, true}) {
-            const Run r = run_arrange(name, rot);
-            require_valid_layout(r.items);
-            all += layout_dump(name, rot, r.items);
-        }
+        for (bool rot : {false, true})
+            all += fast_layout_dump(name, rot, run_arrange(name, Level::Fast, rot).items);
 
     if (std::getenv("ORCA_WRITE_ARRANGE_GOLDEN") != nullptr) {
         std::ofstream(golden_path()) << all;
@@ -939,7 +1278,7 @@ TEST_CASE("Arrange gives the recorded layouts", "[Arrange][Golden]")
 }
 
 // Benchmark, hidden from the default run. Run it with libslic3r_tests "[ArrangeBench]";
-// ORCA_ARRANGE_BENCH="rings,C20" narrows the plates, ORCA_ARRANGE_BENCH_CSV names the output.
+// ORCA_ARRANGE_BENCH="rings,C20" narrows the plates.
 TEST_CASE("Arrange benchmark", "[Arrange][ArrangeBench][.]")
 {
     std::vector<std::string> names = ALL_SCENARIOS;
@@ -948,18 +1287,14 @@ TEST_CASE("Arrange benchmark", "[Arrange][ArrangeBench][.]")
         std::istringstream is(sel);
         for (std::string n; std::getline(is, n, ',');) names.push_back(n);
     }
-    const char   *csv = std::getenv("ORCA_ARRANGE_BENCH_CSV");
-    std::ofstream f(csv ? csv : "arrange_bench.csv");
-    f << "scenario,rotate,items,on_bed0,seconds\n";
     for (const std::string &name : names)
-        for (bool rot : {false, true}) {
-            Run r = run_arrange(name, rot);
-            for (int i = 1; i < bench_repeats(); ++i)
-                r.seconds = std::min(r.seconds, run_arrange(name, rot).seconds);
-            char line[160];
-            std::snprintf(line, sizeof line, "%s,%d,%zu,%d,%.3f", name.c_str(), int(rot), r.items.size(), on_bed0(r.items), r.seconds);
-            f << line << "\n";
-            std::cout << "arrange-bench " << line << std::endl;
-            require_valid_layout(r.items);
-        }
+        for (Level level : bench_levels())
+            for (bool rot : {false, true}) {
+                Run r = run_arrange(name, level, rot);
+                for (int i = 1; i < bench_repeats(); ++i)
+                    r.seconds = std::min(r.seconds, run_arrange(name, level, rot).seconds);
+                write_bench_line(name, level, rot, r, metrics(r.items));
+                INFO(name << " " << level_name(level) << " rotate=" << rot);
+                require_valid_layout(r.items);
+            }
 }
